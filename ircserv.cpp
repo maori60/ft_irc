@@ -59,6 +59,7 @@ private:
     std::map<int, Client> clients;
     std::map<std::string, Channel> channels;
     std::map<std::string, int> nick_to_fd;
+    static bool shutdown_requested;
     
 public:
     IRCServer(const std::string& port, const std::string& pass) 
@@ -67,8 +68,36 @@ public:
     }
     
     ~IRCServer() {
-        if (server_fd != -1) close(server_fd);
-        if (epoll_fd != -1) close(epoll_fd);
+        cleanup();
+    }
+    
+    static void signal_handler(int sig) {
+        if (sig == SIGINT) {
+            std::cout << "\nReceived SIGINT, shutting down gracefully..." << std::endl;
+            shutdown_requested = true;
+        }
+    }
+    
+    void cleanup() {
+        // Send QUIT message to all connected clients
+        for (std::map<int, Client>::iterator it = clients.begin(); it != clients.end(); ++it) {
+            if (it->second.registered) {
+                send_raw(it->first, "ERROR :Server shutting down");
+            }
+            close(it->first);
+        }
+        clients.clear();
+        channels.clear();
+        nick_to_fd.clear();
+        
+        if (server_fd != -1) {
+            close(server_fd);
+            server_fd = -1;
+        }
+        if (epoll_fd != -1) {
+            close(epoll_fd);
+            epoll_fd = -1;
+        }
     }
     
     void init_server(const std::string& port) {
@@ -150,8 +179,8 @@ public:
     void run() {
         struct epoll_event events[MAX_EVENTS];
         
-        while (true) {
-            int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+        while (!shutdown_requested) {
+            int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000); // 1 second timeout
             if (nfds == -1) {
                 if (errno == EINTR) continue;
                 perror("epoll_wait");
@@ -166,6 +195,9 @@ public:
                 }
             }
         }
+        
+        std::cout << "Server loop ended, cleaning up..." << std::endl;
+        cleanup();
     }
     
 private:
@@ -229,6 +261,12 @@ private:
             }
             it->second.buffer.erase(0, pos + 1);
             process_message(fd, line);
+            // Check if client still exists after processing
+            it = clients.find(fd);
+            if (it == clients.end()) {
+                // Client was disconnected during message processing
+                return;
+            }
         }
         
         // Remove incomplete line if buffer too large
@@ -244,8 +282,9 @@ private:
         Client& client = it->second;
         
         // Remove from channels
-        for (std::set<std::string>::iterator ch_it = client.channels.begin();
-             ch_it != client.channels.end(); ++ch_it) {
+        std::set<std::string> channels_copy = client.channels;
+        for (std::set<std::string>::iterator ch_it = channels_copy.begin();
+             ch_it != channels_copy.end(); ++ch_it) {
             leave_channel(fd, *ch_it, "Client disconnected");
         }
         
@@ -373,6 +412,8 @@ private:
         else if (cmd == "PING") {
             if (params.size() > 0) {
                 send_raw(fd, "PONG :" + params[0]);
+            } else {
+                send_raw(fd, "PONG :IRCServer");
             }
         }
         // New operator commands
@@ -438,6 +479,9 @@ private:
             return;
         }
         
+        std::string old_nick = client.nick;
+        bool was_registered = client.registered;
+        
         // Remove old nick mapping
         if (!client.nick.empty()) {
             nick_to_fd.erase(client.nick);
@@ -446,7 +490,57 @@ private:
         client.nick = nick;
         nick_to_fd[nick] = fd;
         
+        // If user was already registered, handle nick change
+        if (was_registered && !old_nick.empty()) {
+            handle_nick_change(fd, old_nick, nick);
+        }
+        
         check_registration(fd);
+    }
+    
+    void handle_nick_change(int fd, const std::string& old_nick, const std::string& new_nick) {
+        Client& client = clients[fd];
+        std::set<int> notified;
+        
+        // Send NICK message to all users who share channels with this user
+        std::string nick_msg = ":" + old_nick + "!" + client.user + "@" + client.hostname + " NICK :" + new_nick;
+
+        // Send to the user themselves first
+        send_raw(fd, nick_msg);
+        notified.insert(fd);
+        
+        // Notify users in all channels this user is in
+        for (std::set<std::string>::iterator ch_it = client.channels.begin();
+             ch_it != client.channels.end(); ++ch_it) {
+            
+            std::map<std::string, Channel>::iterator chan_it = channels.find(*ch_it);
+            if (chan_it != channels.end()) {
+                Channel& channel = chan_it->second;
+                
+                // Update channel member list
+                channel.members.erase(old_nick);
+                channel.members.insert(new_nick);
+                
+                // Update operator list if user was an operator
+                if (channel.operators.find(old_nick) != channel.operators.end()) {
+                    channel.operators.erase(old_nick);
+                    channel.operators.insert(new_nick);
+                }
+                
+                // Notify all members of this channel
+                for (std::set<std::string>::iterator m_it = channel.members.begin();
+                     m_it != channel.members.end(); ++m_it) {
+                    
+                    std::map<std::string, int>::iterator nick_it = nick_to_fd.find(*m_it);
+                    if (nick_it != nick_to_fd.end()) {
+                        if (notified.find(nick_it->second) == notified.end()) {
+                            send_raw(nick_it->second, nick_msg);
+                            notified.insert(nick_it->second);
+                        }
+                    }
+                }
+            }
+        }
     }
     
     void check_registration(int fd) {
@@ -996,17 +1090,27 @@ private:
     }
 };
 
+// Static member definition
+bool IRCServer::shutdown_requested = false;
+
 int main(int argc, char* argv[]) {
     if (argc != 3) {
         std::cerr << "Usage: " << argv[0] << " <port> <password>" << std::endl;
         return 1;
     }
     
-    // Ignore SIGPIPE
+    // Set up signal handlers
+    signal(SIGINT, IRCServer::signal_handler);
+    signal(SIGTERM, IRCServer::signal_handler);
     signal(SIGPIPE, SIG_IGN);
     
-    IRCServer server(argv[1], argv[2]);
-    server.run();
+    try {
+        IRCServer server(argv[1], argv[2]);
+        server.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Server error: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }

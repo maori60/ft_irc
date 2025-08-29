@@ -48,7 +48,7 @@ struct Channel {
     bool topic_protected;
     int user_limit;
     
-    Channel(const std::string& n) : name(n), invite_only(false), topic_protected(false), user_limit(0) {}
+    Channel(const std::string& n) : name(n), invite_only(false), topic_protected(true), user_limit(0) {}
 };
 
 class IRCServer {
@@ -379,8 +379,31 @@ private:
                 send_reply(fd, "461", "JOIN :Not enough parameters");
                 return;
             }
-            std::string key = params.size() > 1 ? params[1] : "";
-            handle_join(fd, params[0], key);
+            // Parse channels and keys
+            std::vector<std::string> channels;
+            std::vector<std::string> keys;
+            std::string ch_param = params[0];
+            std::string key_param = params.size() > 1 ? params[1] : "";
+            // Split channels by ','
+            size_t start = 0, end;
+            while ((end = ch_param.find(',', start)) != std::string::npos) {
+                channels.push_back(ch_param.substr(start, end - start));
+                start = end + 1;
+            }
+            channels.push_back(ch_param.substr(start));
+            // Split keys by ','
+            start = 0;
+            while ((end = key_param.find(',', start)) != std::string::npos) {
+                keys.push_back(key_param.substr(start, end - start));
+                start = end + 1;
+            }
+            if (!key_param.empty())
+                keys.push_back(key_param.substr(start));
+            // For each channel, call handle_join with corresponding key
+            for (size_t i = 0; i < channels.size(); ++i) {
+                std::string key = (i < keys.size()) ? keys[i] : "";
+                handle_join(fd, channels[i], key);
+            }
         }
         else if (cmd == "PART") {
             if (!client.registered) {

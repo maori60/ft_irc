@@ -306,10 +306,78 @@ def test_join_part_channel(host, port, password):
         return False
         
     client.send_raw(f"PART {CHANNEL} :Leaving now")
-    part_msg = client.find_message("PART", exact_params=[CHANNEL, ":Leaving now"]) # Note the colon for trailing param
+    part_msg = client.find_message("PART", exact_params=[CHANNEL, "Leaving now"])
+    if not part_msg:
+        client.log("Did not receive PART confirmation.", 'error')
+        client.disconnect()
+        return False
+    client.disconnect()
+    return True
+    
+@run_test
+def test_multi_channel_join(host, port, password):
+    """Tests joining multiple channels in a single JOIN command."""
+    client = IRCClient(NICK1, USER1)
+    client_op = IRCClient(NICK_OP, USER1)
+    
+    if not client.connect(host, port, password):
+        return False
+    if not client_op.connect(host, port, password):
+        client.disconnect()
+        return False
+    
+    # First set up a channel with key and invite-only mode
+    channel2 = "#test2"
+    channel3 = "#test3"
+    key2 = "key2"
+    
+    # Operator sets up channel2 with key
+    client_op.send_raw(f"JOIN {channel2}")
+    client_op.find_message("JOIN", exact_params=[channel2])
+    client_op.send_raw(f"MODE {channel2} +k {key2}")
+    client_op.find_message("MODE")
+    
+    # Operator sets up channel3 as invite-only
+    client_op.send_raw(f"JOIN {channel3}")
+    client_op.find_message("JOIN", exact_params=[channel3])
+    client_op.send_raw(f"MODE {channel3} +i")
+    client_op.find_message("MODE")
+    
+    # Test joining multiple channels with keys
+    client.send_raw(f"JOIN {CHANNEL},{channel2} {CHANNEL_KEY},{key2}")
+    
+    # Should succeed for both channels
+    join1 = client.find_message("JOIN", exact_params=[CHANNEL])
+    join2 = client.find_message("JOIN", exact_params=[channel2])
+    if not (join1 and join2):
+        client.log("Failed to join channels with keys", 'error')
+        client.disconnect()
+        client_op.disconnect()
+        return False
+    
+    # Try to join invite-only channel without invite
+    client.send_raw(f"JOIN {channel3}")
+    err_invite = client.find_message("473")  # ERR_INVITEONLYCHAN
+    if not err_invite:
+        client.log("Should have received ERR_INVITEONLYCHAN", 'error')
+        client.disconnect()
+        client_op.disconnect()
+        return False
+        
+    # Try to join channel2 with wrong key
+    client.send_raw(f"PART {channel2}")
+    client.find_message("PART")
+    client.send_raw(f"JOIN {channel2} wrongkey")
+    err_key = client.find_message("475")  # ERR_BADCHANNELKEY
+    if not err_key:
+        client.log("Should have received ERR_BADCHANNELKEY", 'error')
+        client.disconnect()
+        client_op.disconnect()
+        return False
     
     client.disconnect()
-    return part_msg is not None
+    client_op.disconnect()
+    return True
 
 @run_test
 def test_channel_messaging(host, port, password):
@@ -400,6 +468,7 @@ def test_partial_message_sending(host, port, password):
     try:
         client.clear_buffer()
         client2.clear_buffer()
+        client2.send_raw(f"JOIN {CHANNEL}")
 
         client.log("Testing partial JOIN command...", 'info')
         # Send JOIN command in two parts
@@ -681,11 +750,12 @@ def main():
         test_join_part_channel,
         test_channel_messaging,
         test_private_messaging,
-        test_partial_message_sending, # New test
-        test_normal_user_kick,        # New test
-        test_normal_user_invite,      # New test
-        test_normal_user_topic_set,   # New test
-        test_normal_user_mode_change  # New test
+        test_partial_message_sending,
+        test_normal_user_kick,       
+        test_normal_user_invite,     
+        test_normal_user_topic_set,  
+        test_normal_user_mode_change, 
+        test_multi_channel_join
     ]
     
     passed_count = 0

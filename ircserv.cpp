@@ -30,7 +30,8 @@ struct Client {
     std::string hostname;
     bool authenticated;
     bool registered;
-    std::string buffer;
+    std::string read_buffer;
+    std::string write_buffer;
     std::set<std::string> channels;
     std::set<std::string> invited_channels;
     
@@ -72,8 +73,9 @@ public:
     }
     
     static void signal_handler(int sig) {
-        if (sig == SIGINT) {
-            std::cout << "\nReceived SIGINT, shutting down gracefully..." << std::endl;
+        if (sig == SIGINT || sig == SIGTERM) {
+            const char *msg = "\nShutdown signal received, shutting down server...\n";
+            write(STDOUT_FILENO, msg, strlen(msg));
             shutdown_requested = true;
         }
     }
@@ -116,8 +118,7 @@ public:
         }
         
         // Make socket non-blocking
-        int flags = fcntl(server_fd, F_GETFL, 0);
-        fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+        fcntl(server_fd, F_SETFL, O_NONBLOCK);
         
         // Validate port
         if (port.empty()) {
@@ -191,7 +192,26 @@ public:
                 if (events[i].data.fd == server_fd) {
                     accept_connection();
                 } else {
-                    handle_client_data(events[i].data.fd);
+                    if (events[i].events & EPOLLIN)
+                    {
+                        handle_client_data(events[i].data.fd);
+                    }
+                    if (clients.find(events[i].data.fd) != clients.end() && (events[i].events & EPOLLOUT))
+                    {
+                        Client &client = clients[events[i].data.fd];
+                        if (!client.write_buffer.empty())
+                        {
+                            ssize_t bytes = send(client.fd, client.write_buffer.c_str(), client.write_buffer.size(), 0);
+                            if (bytes > 0)
+                            {
+                                client.write_buffer.erase(0, bytes);
+                            }
+                            else if (bytes == -1 && errno != EAGAIN && errno != EWOULDBLOCK)
+                            {
+                                disconnect_client(client.fd);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -214,12 +234,11 @@ private:
         }
         
         // Make client socket non-blocking
-        int flags = fcntl(client_fd, F_GETFL, 0);
-        fcntl(client_fd, F_SETFL, flags | O_NONBLOCK);
+        fcntl(client_fd, F_SETFL, O_NONBLOCK);
         
         // Add to epoll
         struct epoll_event ev;
-        ev.events = EPOLLIN | EPOLLET;
+        ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         ev.data.fd = client_fd;
         if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev) == -1) {
             perror("epoll_ctl");
@@ -239,27 +258,30 @@ private:
         if (it == clients.end()) return;
         
         char buffer[BUFFER_SIZE];
-        ssize_t bytes = recv(fd, buffer, sizeof(buffer) - 1, 0);
-        
-        if (bytes <= 0) {
-            if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        while (true) {
+            ssize_t bytes = recv(fd, buffer, sizeof(buffer) - 1, 0);
+            
+            if (bytes <= 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break; // No more data to read
+                }
                 disconnect_client(fd);
+                return;
             }
-            return;
+            
+            buffer[bytes] = '\0';
+            it->second.read_buffer += buffer;
         }
-        
-        buffer[bytes] = '\0';
-        it->second.buffer += buffer;
         
         // Process complete lines (handle both \r\n and \n endings)
         size_t pos;
-        while ((pos = it->second.buffer.find('\n')) != std::string::npos) {
-            std::string line = it->second.buffer.substr(0, pos);
+        while ((pos = it->second.read_buffer.find('\n')) != std::string::npos) {
+            std::string line = it->second.read_buffer.substr(0, pos);
             // Remove \r if present before \n
             if (!line.empty() && line[line.length() - 1] == '\r') {
                 line.erase(line.length() - 1);
             }
-            it->second.buffer.erase(0, pos + 1);
+            it->second.read_buffer.erase(0, pos + 1);
             process_message(fd, line);
             // Check if client still exists after processing
             it = clients.find(fd);
@@ -269,10 +291,6 @@ private:
             }
         }
         
-        // Remove incomplete line if buffer too large
-        if (it->second.buffer.size() > BUFFER_SIZE) {
-            it->second.buffer.clear();
-        }
     }
     
     void disconnect_client(int fd) {
@@ -1104,12 +1122,30 @@ private:
         Client& client = clients[fd];
         std::string nick = client.nick.empty() ? "*" : client.nick;
         std::string reply = ":IRCServer " + code + " " + nick + " " + message + "\r\n";
-        send(fd, reply.c_str(), reply.length(), MSG_NOSIGNAL);
+        errno = 0;
+        ssize_t bytes_send = send(fd, reply.c_str(), reply.length(), 0);
+        if (bytes_send == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("send");
+            disconnect_client(fd);
+            return;
+        } else if (bytes_send < (ssize_t)reply.length()) {
+            // Partial send, buffer the rest
+            client.write_buffer += reply.substr(bytes_send);
+        }
     }
     
     void send_raw(int fd, const std::string& message) {
         std::string msg = message + "\r\n";
-        send(fd, msg.c_str(), msg.length(), MSG_NOSIGNAL);
+        errno = 0;
+        ssize_t bytes_send = send(fd, msg.c_str(), msg.length(), 0);
+        if (bytes_send == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            perror("send");
+            disconnect_client(fd);
+            return;
+        } else if (bytes_send < (ssize_t)msg.length()) {
+            // Partial send, buffer the rest
+            clients[fd].write_buffer += msg.substr(bytes_send);
+        }
     }
 };
 

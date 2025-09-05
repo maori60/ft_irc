@@ -626,13 +626,14 @@ private:
         if (channel.members.find(client.nick) != channel.members.end()) {
             return; // Already in channel
         }
-        
-        // Check channel key
-        if (!channel.key.empty() && channel.key != key) {
-            send_reply(fd, "475", channel_name + " :Cannot join channel (+k)");
-            return;
-        }
-        
+        // https://datatracker.ietf.org/doc/html/rfc1459#section-4.2.1 
+        /*
+        The conditions which affect this are as follows:
+           1.  the user must be invited if the channel is invite-only;
+           2.  the user's nick/username/hostname must not match any
+               active bans;
+           3.  the correct key (password) must be given if it is set.
+        */
         // Check invite-only
         if (channel.invite_only) {
             if (client.invited_channels.find(channel_name) == client.invited_channels.end()) {
@@ -640,6 +641,12 @@ private:
                 return;
             }
             client.invited_channels.erase(channel_name);
+        }
+        
+        // Check channel key
+        if (!channel.key.empty() && channel.key != key) {
+            send_reply(fd, "475", channel_name + " :Cannot join channel (+k)");
+            return;
         }
         
         // Check user limit
